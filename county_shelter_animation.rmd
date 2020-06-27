@@ -1,0 +1,183 @@
+---
+title: "sheltering_counties"
+author: "David McCoy"
+date: "6/27/2020"
+output: html_document
+---
+
+
+
+
+```{r}
+library(ggplot2)
+library(COVID19)
+library(dplyr)
+library(zoo)
+library(ggplot2)
+library(viridis)
+library(glue)
+library(tools)
+library(lubridate)
+library(gifski)
+library(gganimate)
+library(summarytools)
+library(RCurl)
+library(forcats)
+
+```
+
+This code creates an animated gif file that shows the relationship between the public's mobility and reported deaths at the county level thirty days later. The values are 7-day rolling averages. The data includes all counties with 390,000 residents. This cutoff was chosen to include Orleans Parrish in the data.  
+
+The sources include [Google's Mobility Data](https://www.gstatic.com/covid19/mobility/Global_Mobility_Report.csv), The [NYT's public repository of data](https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv), and the [COVID19](https://github.com/datasets/covid-19) API for R.  
+
+
+
+# Counties Cases, Deaths, Mobility: Get data
+```{r}
+gmob <- "https://www.gstatic.com/covid19/mobility/Global_Mobility_Report.csv"
+gmob <- getURL(gmob)
+gmob <- read.csv(textConnection(gmob))
+#saveRDS(gmob, "data/backup/Global_Mobility_Report_june26.rds")
+
+counties <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv"
+counties <- getURL(counties)
+counties <- read.csv(textConnection(counties))
+#saveRDS(counties, "data/backup/nyt_counties_june26.rds")
+
+cc <- covid19("US", level=3, cache=T)
+#saveRDS(cc, "data/backup/covid19api_counties_june26.rds")
+```
+
+# Clean Data
+```{r}
+cc <- readRDS("data/backup/covid19api_counties_june26.rds")
+counties <- readRDS("data/backup/nyt_counties_june26.Rds")
+gmob <- readRDS("data/backup/Global_Mobility_Report_june26.rds")
+
+# Extract time invariant data
+id <- cc %>%
+  ungroup() %>%
+  mutate(
+    id = key_numeric) %>%
+  group_by(id) %>%
+  summarize(
+    population = population[1],
+    fips = id[1],
+    county = administrative_area_level_3[1],
+    state = administrative_area_level_2[1]) %>%
+  ungroup %>%
+  select(-id)
+
+# Clean COVID19 API data
+c <- cc %>%
+  ungroup() %>%
+  mutate(
+    fips = key_numeric,
+    deaths2 = deaths,
+    cases2 = confirmed) %>%
+  select(fips, date, cases2, deaths2) %>%
+  arrange(fips, date)
+
+# Clean NYT data
+nyt <- counties %>%
+  mutate(
+    date = as.Date(date)) %>%
+  select(-state, -county)
+
+# Mobility at county - Many missing values AND counties but large look OK
+m <- gmob %>%
+  filter(country_region_code=="US" & census_fips_code != "" & iso_3166_2_code=="") %>%
+  mutate(
+    date = as.Date(date),
+    fips = census_fips_code,
+    Recreation = retail_and_recreation_percent_change_from_baseline,
+    Grocery = grocery_and_pharmacy_percent_change_from_baseline,
+    Parks = parks_percent_change_from_baseline,
+    Transit = transit_stations_percent_change_from_baseline,
+    Work = workplaces_percent_change_from_baseline,
+    n.Home = - residential_percent_change_from_baseline) %>%
+  select(fips, date, Recreation, Grocery, Parks, Transit, Work, n.Home)
+
+# Most inclusive covid and mobility data
+d <- full_join(c, nyt, by=c("fips", "date"))
+d <- full_join(d, m, by=c("fips", "date"))
+d <- full_join(d, id, by="fips")
+
+rescale = 100000
+
+shelter_county <- d %>%
+  filter(population>390000 & !county %in% c("Kansas City", "New York City", "District of Columbia")) %>%
+  arrange(fips, date) %>%
+  group_by(fips) %>%
+  mutate(
+    cases = ifelse(is.na(cases), 0, cases),
+    deaths = ifelse(is.na(deaths), 0, deaths),
+    dailydeaths = deaths - lag(deaths),
+    dailydeaths  = ifelse(dailydeaths<0 , 0, dailydeaths),
+    dailycases = cases - lag(cases),
+    dailycases = ifelse(dailycases<0 , 0, dailycases),
+    dailydeaths.pc = (dailydeaths/population) * rescale,
+    dailycases.pc = (dailycases/population) * rescale,
+    r.dailydeaths = rollmean(dailydeaths, k = 7, fill = NA),
+    r.dailydeaths.log = log(1+(rollmean(dailydeaths, k = 7, fill = NA))),
+    r.dailydeaths.pc = rollmean(dailydeaths.pc, k = 7, fill = NA),
+    r.dailycases = rollmean(dailycases, k = 7, fill = NA),
+    r.dailycases.log = log(1+(rollmean(dailycases, k = 7, fill = NA))),
+    r.dailycases.pc = rollmean(dailycases.pc, k = 7, fill = NA),
+    Shelter.old = - (Recreation + n.Home + Work + Transit)/4,
+    Shelter = - rowMeans(cbind(Recreation, n.Home, Work, Transit), na.rm=T),
+    r.Shelter = rollmean(Shelter, k=7, fill=NA),
+    Date = format(as.Date(date), "%b %d"),
+    Date.L30 = lag(Date, 30L),
+    Shelter.L30 = lag(Shelter, 30L),
+    r.Shelter.L30 = lag(r.Shelter, 30L),
+    r.dailycases.pc.L30 = 1 + lag(r.dailycases.pc, 30L)) %>%
+  ungroup() %>%
+  filter(date > as.Date("2020-03-18") & date < as.Date("2020-06-20")) %>%
+  group_by(fips) %>%
+  mutate(n = 1:n()) %>%
+  ungroup() 
+
+# Order Date by n
+shelter_county$Date <- fct_reorder(shelter_county$Date, shelter_county$n)
+shelter_county$Date.L30 <- fct_reorder(shelter_county$Date.L30, shelter_county$n)
+
+rm(c, cc, counties, d, id, m, gmob, nyt)
+```
+
+# Plot gganimate: Deaths
+```{r}
+p <- ggplot(data = shelter_county,
+            aes(x=r.Shelter.L30, 
+                y=r.dailydeaths.pc, 
+                color=r.dailycases.pc.L30)) +
+  geom_point(size=4) + 
+  #xlim(-40, 62) + ylim(0, 8) +
+  scale_color_viridis(option="plasma", alpha = .2, 
+                      limits=c(1,115), trans = "log", 
+                      breaks = c(1, 5, 20, 110)) +
+  #theme(text=element_text(family="serif")) +
+  labs(
+    title = "Sheltering Behavior and Daily Deaths per 100k Residents \n 30 Days Later: All US Counties with 400K Residents \n {closest_state}",
+    subtitle = "All values are 7-Day Rolling Averages",
+    caption = "Data Source: Google Mobility Data, NYT, COVID19 API \n Github: DavidRMcCoy",
+    color = "Daily Cases",
+    y = "Daily Deaths per 100k Residents: 30 Days Later",
+    x = "Google Mobility Index: Staying Home + Working (rev.) + Recreation (rev.)") +
+  transition_states(Date.L30,
+                    transition_length = 10,
+                    state_length = 1,
+                    wrap = F) +
+  shadow_wake(wake_length = 0.005) + enter_fade() + exit_shrink()
+
+
+c_s <- animate(p, nframes = 186, detail=20)
+
+anim_save("county_sheltering.gif", animation=c_s)
+
+```
+
+
+
+
+
